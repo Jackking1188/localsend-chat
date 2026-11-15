@@ -49,6 +49,19 @@
 释放到临时位置；不写注册表、不安装依赖，卸载时直接删除 exe 并清理
 `%APPDATA%\LocalSendChat\` 即可。随包分发的第三方组件见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
 
+## 从源码运行
+
+需要 Python 3.11+ 与 Pillow（仓库根目录已提供 `requirements.txt`）：
+
+```bash
+pip install -r requirements.txt
+python run.py
+```
+
+仓库中的 `app/` 即发布包内的程序目录，`run.py` 为启动入口，
+`app/assets/` 存放窗口图标与各尺寸 logo。
+发布用的 7-Zip 自解压包由本地工具链生成，构建脚本不在本仓库内。
+
 ## 已知限制
 
 - 不提供「对方正在输入」与离线消息队列，LocalSend 会话为一次性设计
