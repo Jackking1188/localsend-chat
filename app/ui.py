@@ -15,7 +15,7 @@ import time
 import tkinter as tk
 import tkinter.font as tkfont
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from . import certs, imaging, protocol, share
 from . import theme as _theme
@@ -23,6 +23,7 @@ from .config import Config, local_ip
 from .discovery import DISCOVERY_PORT, Discoverer, probe_ip
 from .server import Server
 from .storage import Bus, Store
+from .visibility import count_online, force_visible, split_visible
 
 ASSETS = Path(__file__).resolve().parent / "assets"
 LOGO_PNG = ASSETS / "logo-gold-512.png"
@@ -179,11 +180,12 @@ class App(tk.Tk):
         # 链接分享服务：与协议层端口隔离，按需启动
         self.share = share.ShareServer()
         self._share_dialog = None
-        # 被「删除设备」隐藏过的指纹：发现结果要按它过滤，否则删了立刻又回来
+        # v2.5.1：只有「屏蔽」才写持久化名单；「删除」不再写入，
+        # 因此设备仍在线时下次刷新就会自然回来。
         try:
-            self._hidden: set[str] = self.store.hidden_fingerprints()
+            self._blocked: set[str] = self.store.blocked_fingerprints()
         except Exception:
-            self._hidden = set()
+            self._blocked = set()
 
         self.discoverer = Discoverer(
             self._my_info,
@@ -197,8 +199,7 @@ class App(tk.Tk):
         self._images: list[tk.PhotoImage] = []       # 缩略图引用，防 GC
         self._thumb_cache: dict = {}
 
-        from . import __version__
-        self.title(f"LocalSend Chat v{__version__} · {self.cfg.alias}")
+        self._apply_window_title()
         self.geometry("1040x700")
         self.minsize(860, 560)
         self.configure(bg=BG)
@@ -223,6 +224,103 @@ class App(tk.Tk):
             "protocol": "https",
             "download": False,
         }
+
+    # ---------------- 窗口标题 / 关于 / 屏蔽 ----------------
+    def _apply_window_title(self) -> None:
+        from . import __version__
+        self.title(f"{self.cfg.panel_title} v{__version__} · {self.cfg.alias}")
+
+    def _on_title_double_click(self, event=None) -> None:
+        """双击版本号八次 -> 校验管理口令 -> 修改面板名称。"""
+        now = time.time()
+        if now - getattr(self, "_title_click_ts", 0.0) > 6.0:
+            self._title_clicks = 0
+        self._title_click_ts = now
+        self._title_clicks = getattr(self, "_title_clicks", 0) + 1
+        if self._title_clicks < 8:
+            return
+        self._title_clicks = 0
+        pwd = simpledialog.askstring("管理员验证", "请输入管理口令：",
+                                     show="*", parent=self)
+        if pwd is None:
+            return
+        if pwd != self.cfg.admin_pass:
+            messagebox.showerror("验证失败", "口令不正确。", parent=self)
+            return
+        new = simpledialog.askstring(
+            "修改面板名称", "输入新的面板名称（留空恢复默认）：",
+            initialvalue=self.cfg.panel_title, parent=self)
+        if new is None:
+            return
+        self.cfg.panel_title = new
+        try:
+            self.lbl_brand.configure(text=self.cfg.panel_title)
+        except Exception:
+            pass
+        self._apply_window_title()
+        self.lbl_status.configure(text="面板名称已更新", fg=OK_GREEN)
+
+    def _open_about(self) -> None:
+        AboutDialog(self)
+
+    def _block_peer(self, row: dict) -> None:
+        """屏蔽：写独立名单，可在「已屏蔽」里逐个或一键恢复。"""
+        fp = row["fp"]
+        alias = row.get("alias") or "该设备"
+        if not messagebox.askyesno(
+                "屏蔽设备",
+                f"确定要屏蔽「{alias}」吗？\n\n"
+                "屏蔽后点「刷新设备」也不会再出现，但可在左下角\n"
+                "「已屏蔽」中恢复。聊天记录会保留。\n\n"
+                "只想暂时移出列表请用「删除该设备」。",
+                parent=self):
+            return
+        try:
+            self.store.block_peer(fp, alias)
+            self._blocked = self.store.blocked_fingerprints()
+        except Exception as e:
+            messagebox.showerror("屏蔽失败", str(e), parent=self)
+            return
+        self.online.pop(fp, None)
+        if self.current_fp == fp:
+            self.current_fp = ""
+            self._clear_bubbles()
+            self._restore_header()
+        self._reload_keep_selection()
+        self.lbl_status.configure(
+            text=f"已屏蔽 {alias} · 可在「已屏蔽」中恢复", fg=OK_GREEN)
+
+    def _unblock_peer(self, fp: str) -> None:
+        try:
+            self.store.unblock_peer(fp)
+            self._blocked = self.store.blocked_fingerprints()
+        except Exception as e:
+            messagebox.showerror("恢复失败", str(e), parent=self)
+            return
+        self._reload_keep_selection()
+        self.lbl_status.configure(text="已恢复该设备，点「刷新设备」即可看到",
+                                  fg=OK_GREEN)
+
+    def _clear_blocked(self) -> None:
+        if not self._blocked:
+            self.lbl_status.configure(text="屏蔽列表本来就是空的", fg=FG_DIM)
+            return
+        if not messagebox.askyesno(
+                "清空屏蔽列表",
+                f"确定要恢复全部 {len(self._blocked)} 台被屏蔽的设备吗？",
+                parent=self):
+            return
+        try:
+            self.store.clear_blocked()
+            self._blocked = set()
+        except Exception as e:
+            messagebox.showerror("清空失败", str(e), parent=self)
+            return
+        self._reload_keep_selection()
+        self.lbl_status.configure(text="屏蔽列表已清空", fg=OK_GREEN)
+
+    def _open_blocked(self) -> None:
+        BlockedDialog(self)
 
     # ---------------- 布局 ----------------
     def _set_icon(self):
@@ -301,8 +399,16 @@ class App(tk.Tk):
             tk.Label(box, text="◈", bg="#d9a441", fg="#3a2a08",
                      font=("Microsoft YaHei UI", 13, "bold")).pack(expand=True)
 
-        tk.Label(brand, text="LocalSend Chat", bg=BG_SIDE, fg=FG,
-                 font=("Microsoft YaHei UI", 12, "bold")).pack(side="left", padx=(9, 10))
+        self.lbl_brand = tk.Label(brand, text=self.cfg.panel_title, bg=BG_SIDE, fg=FG,
+                                  font=("Microsoft YaHei UI", 12, "bold"),
+                                  cursor="hand2")
+        self.lbl_brand.pack(side="left", padx=(9, 10))
+        self.lbl_brand.bind("<Double-Button-1>", self._on_title_double_click)
+        from . import __version__ as _ver
+        self.lbl_version = tk.Label(brand, text=f"v{_ver}", bg=BG_SIDE, fg=FG_TIME,
+                                    font=("Consolas", 9), cursor="hand2")
+        self.lbl_version.pack(side="left", padx=(0, 10))
+        self.lbl_version.bind("<Double-Button-1>", self._on_title_double_click)
         tk.Label(brand, text=f"本机 · {self.cfg.alias}", bg=BG_SIDE, fg=FG_TIME,
                  font=FONT_SM).pack(side="left")
 
@@ -310,7 +416,8 @@ class App(tk.Tk):
         self.lbl_status = tk.Label(top, text="●  就绪", bg=BG_SIDE, fg=OK_GREEN, font=FONT_SM)
         self.lbl_status.pack(side="right", padx=(4, 16))
 
-        for text, cmd in (("设置", self._open_settings),
+        for text, cmd in (("关于", self._open_about),
+                          ("设置", self._open_settings),
                           ("诊断", self._open_diag),
                           ("添加设备", self._open_add_peer),
                           ("刷新设备", self._refresh)):
@@ -381,6 +488,16 @@ class App(tk.Tk):
         self.lbl_theme.bind("<Button-1>", lambda e: self._open_theme())
         self.lbl_theme.bind("<Enter>", lambda e: self.lbl_theme.configure(fg=ACCENT))
         self.lbl_theme.bind("<Leave>", lambda e: self.lbl_theme.configure(fg=FG_DIM))
+
+        blocked_row = tk.Frame(foot, bg=BG_SIDE)
+        blocked_row.pack(fill="x", pady=(5, 0))
+        self.lbl_blocked = tk.Label(
+            blocked_row, text="已屏蔽 (0)", bg=BG_SIDE, fg=FG_TIME,
+            font=FONT_SM, cursor="hand2", anchor="w")
+        self.lbl_blocked.pack(side="left")
+        self.lbl_blocked.bind("<Button-1>", lambda e: self._open_blocked())
+        self.lbl_blocked.bind("<Enter>", lambda e: self.lbl_blocked.configure(fg=ACCENT))
+        self.lbl_blocked.bind("<Leave>", lambda e: self.lbl_blocked.configure(fg=FG_TIME))
 
         # ---------------- 右侧 ----------------
         right = tk.Frame(body, bg=BG)
@@ -478,11 +595,11 @@ class App(tk.Tk):
     def _load_conversations(self) -> None:
         self._rows: list[tuple[str, dict]] = []
 
-        online_fps = set()
-        for fp, info in self.online.items():
-            if fp in self._hidden:
-                continue
-            online_fps.add(fp)
+        # 刷新与手动添加共用同一套可见性判断；只有「屏蔽」会过滤设备。
+        on_list, off_list = split_visible(
+            self.online, self.store.peers(), self._blocked, self.my_fingerprint)
+
+        for fp, info in on_list:
             self._rows.append(("online", {
                 "fp": fp,
                 "alias": info.get("alias") or "未知设备",
@@ -491,18 +608,16 @@ class App(tk.Tk):
                 "info": info,
             }))
 
-        for p in self.store.peers():
-            fp = p["fingerprint"]
-            if fp in online_fps or fp in self._hidden:
-                continue
+        for fp, p in off_list:
             self._rows.append(("offline", {
                 "fp": fp,
-                "alias": p["alias"] or "未知设备",
+                "alias": p.get("alias") or "未知设备",
                 "preview": self._last_message(fp),
                 "online": False,
-                "info": {"ip": p["ip"], "port": p["port"],
-                         "protocol": p["protocol"],
-                         "deviceModel": p["device"], "alias": p["alias"]},
+                "info": {"ip": p.get("ip", ""), "port": p.get("port", 0),
+                         "protocol": p.get("protocol", ""),
+                         "deviceModel": p.get("device", ""),
+                         "alias": p.get("alias", "")},
             }))
 
         self._rows.sort(key=lambda r: (not r[1]["online"], -(self._preview_ts(r[1]["fp"]))))
@@ -517,10 +632,15 @@ class App(tk.Tk):
             w.destroy()
         self._row_widgets.clear()
 
-        online_n = sum(1 for _k, r in self._rows if r.get("online"))
+        # 计数必须基于过滤后的 _rows，永远等于列表里数得出来的数量
+        online_n = count_online([r for _k, r in self._rows])
         try:
             self.lbl_count.configure(
                 text=f"{online_n} 在线" if online_n else f"{len(self._rows)} 个对话")
+        except Exception:
+            pass
+        try:
+            self.lbl_blocked.configure(text=f"已屏蔽 ({len(self._blocked)})")
         except Exception:
             pass
 
@@ -595,11 +715,14 @@ class App(tk.Tk):
         self._row_widgets[fp] = box
 
     def _row_menu(self, event, row: dict) -> None:
-        """会话行右键菜单：删除设备 / 清空聊天记录 / 复制 IP。"""
+        """会话行右键菜单：删除 / 屏蔽 / 清空记录 / 复制 IP。"""
         m = tk.Menu(self, tearoff=0, bg=BG_HOVER, fg=FG,
                     activebackground=ACCENT, activeforeground="white",
                     bd=0, font=FONT_SM)
-        m.add_command(label="  删除该设备  ", command=lambda: self._delete_peer(row))
+        m.add_command(label="  删除该设备（刷新后可再出现）  ",
+                      command=lambda: self._delete_peer(row))
+        m.add_command(label="  屏蔽该设备  ",
+                      command=lambda: self._block_peer(row))
         m.add_command(label="  清空聊天记录  ",
                       command=lambda: self._clear_history(row["fp"]))
         info = row.get("info") or {}
@@ -629,16 +752,21 @@ class App(tk.Tk):
         """
         fp = row["fp"]
         alias = row.get("alias") or "该设备"
-        if not messagebox.askyesno(
-                "删除设备",
-                f"确定要删除「{alias}」吗？\n\n"
-                "删除后它不会再自动出现在列表里（可在「已删除设备」中还原）。\n"
-                "聊天记录默认保留，如需一并清除请用右键菜单的「清空聊天记录」。",
-                parent=self):
+        ans = messagebox.askyesnocancel(
+            "删除设备",
+            f"确定从列表移除「{alias}」吗？\n\n"
+            "删除不会拉黑对方：下次点「刷新设备」或对方发消息时，\n"
+            "只要它还在线就会重新出现。想让它永远不出现，\n"
+            "请用右键菜单的「屏蔽该设备」。\n\n"
+            "选「是」：移除并清空聊天记录\n"
+            "选「否」：仅移除，保留聊天记录\n"
+            "选「取消」：什么也不做",
+            parent=self)
+        if ans is None:
             return
         try:
-            self.store.hide_peer(fp, alias)
-            self._hidden.add(fp)
+            # 关键：只删会话行（可选连带消息），绝不写任何持久化名单
+            self.store.delete_peer(fp, drop_history=bool(ans))
         except Exception as e:
             messagebox.showerror("删除失败", str(e), parent=self)
             return
@@ -652,7 +780,8 @@ class App(tk.Tk):
             except Exception:
                 pass
         self._reload_keep_selection()
-        self.lbl_status.configure(text=f"已删除设备 {alias}", fg=OK_GREEN)
+        self.lbl_status.configure(
+            text=f"已移除 {alias} · 刷新后可重新出现", fg=OK_GREEN)
 
     def _clear_history(self, fp: str) -> None:
         if not messagebox.askyesno("清空聊天记录",
@@ -1026,17 +1155,7 @@ class App(tk.Tk):
                 elif kind == "scan_done":
                     self._handle_scan_done(payload)
                 elif kind == "manual_probe":
-                    self._manual_result = (payload.get("ip"), payload.get("info"))
-                    peer = payload.get("info")
-                    if peer:
-                        fp = (peer.get("fingerprint") or "").strip()
-                        if fp:
-                            self.online[fp] = peer
-                            self.store.upsert_peer(peer, peer.get("ip") or "")
-                            self._reload_keep_selection()
-                            self.lbl_status.configure(
-                                text=f"已添加 {peer.get('alias')} @ {peer.get('ip')}",
-                                fg=OK_GREEN)
+                    self._handle_manual_probe(payload)
                 elif kind == "msg_status":
                     self._handle_msg_status(payload)
                 elif kind == "error":
@@ -1044,6 +1163,27 @@ class App(tk.Tk):
             except Exception:
                 pass
         self.after(180, self._tick)
+
+    def _handle_manual_probe(self, payload: dict) -> None:
+        """手动「添加设备」结果：明确输入 IP 就不走任何过滤。"""
+        self._manual_result = (payload.get("ip"), payload.get("info"))
+        peer = payload.get("info")
+        if not peer:
+            return
+        fp = (peer.get("fingerprint") or "").strip()
+        if not fp:
+            return
+        # 即使这台设备曾被屏蔽，手动输入 IP 也必须能建立会话
+        self._blocked = force_visible(fp, self._blocked)
+        try:
+            self.store.unblock_peer(fp)
+        except Exception:
+            pass
+        self.online[fp] = peer
+        self.store.upsert_peer(peer, peer.get("ip") or "")
+        self._reload_keep_selection()
+        self.lbl_status.configure(
+            text=f"已添加 {peer.get('alias')} @ {peer.get('ip')}", fg=OK_GREEN)
 
     def _handle_msg_status(self, payload: dict) -> None:
         """发送结果回填：送达成「已发送」，失败标红并可点重发。"""
@@ -1102,8 +1242,8 @@ class App(tk.Tk):
         fp = (info.get("fingerprint") or "").strip()
         if not fp:
             return
-        # 用户删过的设备不再自动回来；想恢复请用「已删除设备」里的还原
-        if fp in self._hidden:
+        # 只有「屏蔽」会过滤发现结果；「删除」不写名单，刷新即可重新出现
+        if fp in self._blocked:
             return
         self.online[fp] = info
         self.store.upsert_peer(info, info.get("ip") or "")
@@ -1133,8 +1273,10 @@ class App(tk.Tk):
 
     def _handle_scan_done(self, payload: dict) -> None:
         found = int(payload.get("found") or 0)
-        online = int(payload.get("online") or 0)
         st = payload.get("stats") or {}
+        # 计数一律以过滤后的可见列表为准，保证顶栏数字 = 左侧数得出来的数量
+        self._load_conversations()
+        online = count_online([r for _k, r in self._rows])
         if online:
             self.lbl_status.configure(
                 text=f"扫描完成：在线 {online} 台（本次新发现 {found} 台）", fg=OK_GREEN)
@@ -1178,7 +1320,9 @@ class App(tk.Tk):
                 self.bus.emit("error", text=f"扫描出错：{e}")
             st = self.discoverer.stats.as_dict()
             self._scanning_ui = False
-            self.bus.emit("scan_done", found=found, online=len(self.online), stats=st)
+            visible = count_online(
+                [r for _k, r in getattr(self, "_rows", [])])
+            self.bus.emit("scan_done", found=found, online=visible, stats=st)
 
         import threading
         threading.Thread(target=worker, daemon=True).start()
@@ -2053,6 +2197,13 @@ class SettingsDialog(tk.Toplevel):
                   f"证书：{info['path']}"),
         ).pack(anchor="w", padx=16, pady=(8, 0))
 
+        manage = tk.Frame(self, bg=BG)
+        manage.pack(fill="x", padx=16, pady=(10, 0))
+        tk.Button(manage, text="管理已屏蔽设备 / 清空屏蔽列表",
+                  command=self.app._open_blocked, bg=BG_HOVER, fg=FG_DIM,
+                  font=FONT_SM, relief="flat", bd=0, padx=10, pady=4,
+                  cursor="hand2").pack(side="left")
+
         btns = tk.Frame(self, bg=BG)
         btns.pack(fill="x", side="bottom", padx=16, pady=14)
         tk.Button(btns, text="保存", command=self._save, bg=ACCENT, fg="white",
@@ -2073,7 +2224,7 @@ class SettingsDialog(tk.Toplevel):
         alias = self.e_alias.get().strip()
         if alias:
             self.app.cfg.alias = alias
-            self.app.title(f"LocalSend Chat · {alias}")
+            self.app._apply_window_title()
         d = self.e_dir.get().strip()
         if d:
             try:
@@ -2402,6 +2553,102 @@ class DiagDialog(tk.Toplevel):
                 parent=self)
         except Exception as e:
             messagebox.showerror("失败", f"无法提权：{e}", parent=self)
+
+
+class AboutDialog(tk.Toplevel):
+    """关于：版本、功能、端口与上游声明。"""
+
+    def __init__(self, app: App) -> None:
+        super().__init__(app)
+        from . import __version__
+        self.title("关于 LocalSend Chat")
+        self.configure(bg=BG)
+        self.geometry("470x370")
+        self.resizable(False, False)
+        self.transient(app)
+        self.grab_set()
+
+        tk.Label(self, text=app.cfg.panel_title, bg=BG, fg=FG,
+                 font=("Microsoft YaHei UI", 14, "bold")).pack(pady=(22, 2))
+        tk.Label(self, text=f"版本 v{__version__}", bg=BG, fg=ACCENT,
+                 font=("Consolas", 10)).pack()
+        text = (
+            "一个套在 LocalSend Protocol v2 之上的局域网聊天窗口。\n"
+            "协议层未作改动，可与官方 LocalSend 客户端互相收发。\n\n"
+            "· 纯局域网，无服务器、无账号、不上传云端\n"
+            "· 聊天气泡、6 套配色、图片缩略图、一对多群发\n"
+            "· 链接分享：手机浏览器直接下载文件\n\n"
+            "53317 用于协议收发，53319 用于链接分享。\n"
+            "聊天记录与配置位于 %APPDATA%\\LocalSendChat\\。\n\n"
+            "本项目非 LocalSend 官方衍生版本，与上游无隶属关系。\n"
+            "LocalSend 为 Apache-2.0 协议的开源项目。\n\n"
+            "提示：双击版本号八次可修改面板名称。"
+        )
+        tk.Label(self, text=text, bg=BG, fg=FG_DIM, font=FONT_SM,
+                 justify="left", anchor="w").pack(fill="x", padx=24, pady=(16, 0))
+        tk.Button(self, text="关闭", command=self.destroy, bg=ACCENT, fg="white",
+                  font=FONT_UI, relief="flat", bd=0, padx=26, pady=5,
+                  cursor="hand2").pack(side="bottom", pady=14)
+
+
+class BlockedDialog(tk.Toplevel):
+    """已屏蔽设备：逐个恢复或一键清空。"""
+
+    def __init__(self, app: App) -> None:
+        super().__init__(app)
+        self.app = app
+        self.title("已屏蔽设备")
+        self.configure(bg=BG)
+        self.geometry("450x340")
+        self.transient(app)
+        self.grab_set()
+        self._build()
+
+    def _build(self) -> None:
+        for w in list(self.winfo_children()):
+            w.destroy()
+        try:
+            rows = self.app.store.blocked_peers()
+        except Exception:
+            rows = []
+        tk.Label(self, text="被屏蔽的设备不会出现在列表里，刷新也不会回来。",
+                 bg=BG, fg=FG_DIM, font=FONT_SM, anchor="w",
+                 justify="left").pack(fill="x", padx=16, pady=(14, 8))
+
+        box = tk.Frame(self, bg=BG)
+        box.pack(fill="both", expand=True, padx=16)
+        if not rows:
+            tk.Label(box, text="（暂无屏蔽设备）", bg=BG, fg=FG_TIME,
+                     font=FONT_SM).pack(pady=18)
+        for r in rows:
+            line = tk.Frame(box, bg=BG_INPUT)
+            line.pack(fill="x", pady=3)
+            alias = r.get("alias") or "未知设备"
+            fp = str(r.get("fingerprint") or "")[:10]
+            tk.Label(line, text=f"{alias}  ·  {fp}...", bg=BG_INPUT, fg=FG,
+                     font=FONT_SM, anchor="w").pack(side="left", padx=10, pady=7)
+            tk.Button(line, text="恢复", bg=BG_HOVER, fg=OK_GREEN,
+                      font=FONT_SM, relief="flat", bd=0, padx=12,
+                      cursor="hand2",
+                      command=lambda f=r.get("fingerprint"): self._restore(f)
+                      ).pack(side="right", padx=8)
+
+        btns = tk.Frame(self, bg=BG)
+        btns.pack(fill="x", side="bottom", padx=16, pady=12)
+        tk.Button(btns, text="一键全部恢复", command=self._restore_all,
+                  bg=BG_HOVER, fg=FG, font=FONT_SM, relief="flat", bd=0,
+                  padx=12, pady=5, cursor="hand2").pack(side="left")
+        tk.Button(btns, text="关闭", command=self.destroy, bg=ACCENT,
+                  fg="white", font=FONT_UI, relief="flat", bd=0, padx=22,
+                  pady=5, cursor="hand2").pack(side="right")
+
+    def _restore(self, fp: str) -> None:
+        self.app._unblock_peer(fp)
+        self._build()
+
+    def _restore_all(self) -> None:
+        self.app._clear_blocked()
+        self._build()
 
 
 def main() -> None:

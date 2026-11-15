@@ -44,6 +44,8 @@ DEFAULTS = {
     "history_limit": 500,
     "ui_port": 0,
     "theme": "",
+    "panel_title": APP_NAME,
+    "admin_pass": "qinhaibin",
 }
 
 
@@ -145,6 +147,19 @@ class Config:
             return max(20, int(self._data.get("history_limit") or 500))
         except Exception:
             return 500
+
+    @property
+    def panel_title(self) -> str:
+        """窗口与面板上显示的产品名，可在「关于」里改。"""
+        return str(self._data.get("panel_title") or APP_NAME)
+
+    @panel_title.setter
+    def panel_title(self, v: str) -> None:
+        self.set("panel_title", (v or "").strip()[:40] or APP_NAME)
+
+    @property
+    def admin_pass(self) -> str:
+        return str(self._data.get("admin_pass") or "qinhaibin")
 
 
 def default_alias() -> str:

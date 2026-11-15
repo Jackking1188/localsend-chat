@@ -266,16 +266,22 @@ class Discoverer:
                 return None
 
             self.stats.scan_tried += len(hosts)
+            # 同一台设备可能占多个 IP（WLAN / 热点 / 虚拟网卡），
+            # 按指纹去重后再累加，否则「本次新发现 N 台」会虚高。
+            counted: set[str] = set()
             with ThreadPoolExecutor(max_workers=64) as pool:
                 for info in pool.map(probe, hosts):
                     if info:
                         fp = (info.get("fingerprint") or "").strip()
                         mine = (self._my_info().get("fingerprint") or "").strip()
                         if fp and fp != mine:
-                            found += 1
-                            self.stats.scan_hit += 1
                             with self._lock:
                                 self._seen[fp] = time.time()
+                            if fp in counted:
+                                continue
+                            counted.add(fp)
+                            found += 1
+                            self.stats.scan_hit += 1
                             self._emit(info)
                             if progress:
                                 try:

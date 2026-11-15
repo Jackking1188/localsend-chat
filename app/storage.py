@@ -155,10 +155,25 @@ class Store:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    # ---------- 设备删除 ----------
+    # ---------- 设备删除 / 屏蔽 ----------
     def clear_history(self, peer_fp: str) -> None:
         with self._lock:
             self._conn.execute("DELETE FROM messages WHERE peer_fp=?", (peer_fp,))
+            self._conn.commit()
+
+    def delete_peer(self, fp: str, drop_history: bool = False) -> None:
+        """删除会话（v2.5.1）：只移出列表，绝不写持久化名单。
+
+        删除的本意是「不想看这段对话了」，不是「这台设备永远别出现」。
+        设备还在线，下次刷新或组播回应就该重新出现。
+        """
+        fp = (fp or "").strip()
+        if not fp:
+            return
+        with self._lock:
+            self._conn.execute("DELETE FROM peers WHERE fingerprint=?", (fp,))
+            if drop_history:
+                self._conn.execute("DELETE FROM messages WHERE peer_fp=?", (fp,))
             self._conn.commit()
 
     def _ensure_hidden_table(self) -> None:
@@ -172,11 +187,13 @@ class Store:
             self._conn.commit()
 
     def hide_peer(self, fp: str, alias: str = "", drop_history: bool = False) -> None:
-        """删除设备。
+        """屏蔽设备（v2.5.1 起专用，删除动作不再调用这里）。
 
-        只删 peers 行没用——子网扫描几秒后就会把它重新加回来，
-        用户会觉得「删不掉」。所以额外记一条 hidden 记录，发现结果按它过滤。
+        屏蔽与删除是两种语义：只有用户明确选「屏蔽该设备」才写这份
+        持久化名单，且必须能在「已屏蔽」列表里逐个或一键恢复。
         drop_history=True 时连带清空该设备的聊天记录。
+
+        注：沿用旧表名 hidden_peers 以兼容已有数据库，语义已是 blocked。
         """
         fp = (fp or "").strip()
         if not fp:
@@ -218,6 +235,22 @@ class Store:
             rows = self._conn.execute(
                 "SELECT * FROM hidden_peers ORDER BY hidden_at DESC").fetchall()
         return [dict(r) for r in rows]
+
+    # --- v2.5.1 屏蔽语义别名（UI 只读这一组） ---
+    def block_peer(self, fp: str, alias: str = "") -> None:
+        self.hide_peer(fp, alias, drop_history=False)
+
+    def unblock_peer(self, fp: str) -> None:
+        self.unhide_peer(fp)
+
+    def clear_blocked(self) -> None:
+        self.clear_hidden()
+
+    def blocked_fingerprints(self) -> set[str]:
+        return self.hidden_fingerprints()
+
+    def blocked_peers(self) -> list[dict]:
+        return self.hidden_peers()
 
     def trusted_fingerprints(self) -> set[str]:
         with self._lock:
