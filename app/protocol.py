@@ -1,7 +1,7 @@
 """LocalSend Protocol v2 客户端：发送文字 / 文件，注册自身。
 
 只做协议实现，不改协议语义：
-  POST /api/localsend/v2/register          {"info": {...}} -> {"info": {...}, "peers": [...]}
+  POST /api/localsend/v2/register          <扁平 DeviceInfo> -> <扁平 DeviceInfo>
   POST /api/localsend/v2/prepare-upload    {"info": {...}, "files": {id: meta}} -> {sessionId, files:{id:token}}
   POST /api/localsend/v2/upload?sessionId&fileId&token   <binary>
   POST /api/localsend/v2/cancel?sessionId
@@ -148,9 +148,23 @@ def _snippet(obj) -> str:
 
 
 def register(peer: dict, my_info: dict, timeout: float = 8.0) -> tuple[bool, dict]:
+    """向对端注册自身。
+
+    官方 LocalSend v2 的 /register 请求体是**扁平的 DeviceInfo**，不是
+    {"info": {...}}。实测对原版 Android(Realme)/Windows 客户端发送后一种
+    写法会返回 400 "Request body malformed"。这里按官方格式发送；返回体
+    两种形状都兼容：官方回扁平 DeviceInfo，本程序自家 server 回
+    {"info": {...}, "peers": []}。
+    """
+    payload = dict(my_info)
+    payload.setdefault("announce", True)
     try:
-        code, body = _post_json(peer, "/register", {"info": my_info}, timeout)
-        return code == 200, body
+        code, body = _post_json(peer, "/register", payload, timeout)
+        if code != 200:
+            return False, body
+        if isinstance(body.get("info"), dict):
+            return True, body
+        return True, {"info": body, "peers": body.get("peers") or []}
     except Exception:
         return False, {}
 

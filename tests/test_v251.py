@@ -316,5 +316,45 @@ class AppRegressionTests(unittest.TestCase):
                       self.app.lbl_status.cget("text"))
 
 
+class RegisterProtocolTests(unittest.TestCase):
+    """官方 LocalSend 的 /register 要扁平 DeviceInfo，包一层 info 会被回 400。
+
+    实测对象：Realme 手机（LocalSend 2.0 / mobile）与 Windows 端 2.1。
+    """
+
+    def test_register_sends_flat_device_info(self):
+        from app import protocol
+        mine = peer("FP-ME", "我")
+        with mock.patch.object(protocol, "_post_json",
+                               return_value=(200, {"alias": "对方"})) as post:
+            ok, body = protocol.register(peer("FP-X", "对方"), mine)
+        self.assertTrue(ok)
+        args = post.call_args.args
+        self.assertEqual(args[1], "/register")
+        self.assertNotIn("info", args[2], "官方协议不接受 {\"info\": ...} 外壳")
+        self.assertEqual(args[2]["fingerprint"], "FP-ME")
+        self.assertEqual(args[2]["alias"], "我")
+        self.assertTrue(args[2]["announce"])
+        self.assertEqual(body["info"]["alias"], "对方")
+
+    def test_register_accepts_wrapped_server_response(self):
+        from app import protocol
+        wrapped = {"info": {"alias": "对端"}, "peers": []}
+        with mock.patch.object(protocol, "_post_json",
+                               return_value=(200, wrapped)):
+            ok, body = protocol.register(peer("FP-X", "对端"),
+                                         peer("FP-ME", "我"))
+        self.assertTrue(ok)
+        self.assertEqual(body["info"]["alias"], "对端")
+
+    def test_register_reports_http_error(self):
+        from app import protocol
+        with mock.patch.object(protocol, "_post_json",
+                               return_value=(400, {"message": "Request body malformed"})):
+            ok, _ = protocol.register(peer("FP-X", "对端"),
+                                      peer("FP-ME", "我"))
+        self.assertFalse(ok)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
