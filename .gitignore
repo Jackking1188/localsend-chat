@@ -1,0 +1,28 @@
+# 私钥与证书：绝不入库，泄露后他人可冒充本机收发消息
+cert.pem
+key.pem
+
+# 本机配置、设备指纹与聊天记录
+config.json
+history.jsonl
+*.db
+*.log
+
+# Python 缓存与打包中间产物
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec
+backup/
+.venv/
+
+# 二进制与本地发布附件一律不入库，走 GitHub Release
+LocalSendChat.exe
+*.exe
+release-assets/
+
+# 系统杂项
+.DS_Store
+Thumbs.db
+desktop.ini
