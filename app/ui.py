@@ -17,7 +17,7 @@ import tkinter.font as tkfont
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
-from . import certs, imaging, protocol, share
+from . import certs, dnd, imaging, protocol, share
 from . import theme as _theme
 from .config import Config, local_ip
 from .discovery import DISCOVERY_PORT, Discoverer, probe_ip
@@ -152,6 +152,127 @@ def _fmt_size(n: int) -> str:
     return f"{n:.1f} GB"
 
 
+class _StatusLabel(tk.Label):
+    """顶栏状态文字：长文案自动按可用宽度截断，悬停显示全文。
+
+    顶栏右侧固定排着 6 个功能按钮，状态文字一旦过长，Tk 的 pack 会把它
+    压到按钮上面（截图里「添加设备 / 刷新设备 / 链接分享」被盖住）。
+    这里从控件自身限制显示宽度，按钮永远保留自己的位置。
+    """
+
+    def __init__(self, master, **kw):
+        self._full_text = str(kw.pop("text", ""))
+        super().__init__(master, **kw)
+        self._max_px = 150
+        self._truncated = False
+        self._tip = None
+        self.bind("<Enter>", self._show_tip)
+        self.bind("<Leave>", self._hide_tip)
+        self._apply_text()
+
+    # -- 对外接口 -----------------------------------------------------
+    def configure(self, cnf=None, **kw):
+        opts: dict = {}
+        if isinstance(cnf, dict):
+            opts.update(cnf)
+        opts.update(kw)
+        if "text" in opts:
+            self._full_text = str(opts["text"])
+            opts["text"] = self._fit(self._full_text)
+        if "font" in opts and "text" not in opts:
+            opts["text"] = self._fit(self._full_text)
+        result = super().configure(opts)
+        self._clamp_width()
+        return result
+
+    def cget(self, key):
+        # 调用方（含测试）拿到的仍是完整文案，截断只发生在绘制层
+        if key == "text":
+            return self._full_text
+        return super().cget(key)
+
+    def refit(self) -> None:
+        """根据顶栏当前宽度重新计算状态文字上限。"""
+        try:
+            top = self.master
+            total = top.winfo_width()
+            if total <= 1:
+                return
+            # 必须用「请求宽度」：若已有按钮被挤窄，用实际宽度会形成
+            # 「越挤越以为有空位 → 状态文字再变长」的正反馈。
+            used = sum(w.winfo_reqwidth() for w in top.winfo_children()
+                       if w is not self)
+            gaps = 16 + 16 + 8 * len(top.winfo_children())
+            self._max_px = max(90, min(300, total - used - gaps))
+        except Exception:
+            self._max_px = 150
+        self._apply_text()
+
+    # -- 内部 ---------------------------------------------------------
+    def _fit(self, text: str) -> str:
+        if not text:
+            self._truncated = False
+            return ""
+        try:
+            font = tkfont.Font(root=self, font=self.cget("font"))
+        except Exception:
+            font = tkfont.Font(size=9)
+        if font.measure(text) <= self._max_px:
+            self._truncated = False
+            return text
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if font.measure(text[:mid] + "…") <= self._max_px:
+                lo = mid
+            else:
+                hi = mid - 1
+        self._truncated = True
+        return text[:lo].rstrip() + "…"
+
+    def _apply_text(self) -> None:
+        super().configure(text=self._fit(self._full_text))
+        self._clamp_width()
+
+    def _clamp_width(self) -> None:
+        """把 Label 的请求宽度钉在「当前显示的文字」上，而不是原始长文。
+
+        否则 Tk 会按未截断的长文案分配空间，把最左边的「链接分享」按钮
+        挤成 38px，出现文字显示不全的新问题。
+        """
+        try:
+            font = tkfont.Font(root=self, font=self.cget("font"))
+            shown = super().cget("text")
+            unit = max(1, font.measure("0"))
+            px = font.measure(shown) + 10
+            super().configure(width=max(2, int(px / unit) + 1))
+        except Exception:
+            pass
+
+    def _show_tip(self, _e=None) -> None:
+        if not self._truncated or not self._full_text:
+            return
+        self._hide_tip()
+        try:
+            tip = tk.Toplevel(self, bd=1, relief="solid", bg="#fff8dc")
+            tip.wm_overrideredirect(True)
+            tip.wm_geometry(f"+{self.winfo_rootx()}+{self.winfo_rooty() + self.winfo_height() + 4}")
+            tk.Label(tip, text=self._full_text, bg="#fff8dc", fg="#222222",
+                     font=FONT_SM, wraplength=380, justify="left",
+                     padx=10, pady=6).pack()
+            self._tip = tip
+        except Exception:
+            pass
+
+    def _hide_tip(self, _e=None) -> None:
+        tip, self._tip = self._tip, None
+        if tip is not None:
+            try:
+                tip.destroy()
+            except Exception:
+                pass
+
+
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -199,6 +320,12 @@ class App(tk.Tk):
         self._images: list[tk.PhotoImage] = []       # 缩略图引用，防 GC
         self._thumb_cache: dict = {}
 
+        # v2.6.3 拖放：拖入即发为主，待发送区只兜底（未选设备/手动添加）
+        self._attachments: list[str] = []
+        self._dnd_ready = False
+        self._dnd_static: set[str] = set()
+        self._dnd_active = False
+
         self._apply_window_title()
         self.geometry("1040x700")
         self.minsize(860, 560)
@@ -206,6 +333,7 @@ class App(tk.Tk):
         self._set_icon()
 
         self._build()
+        self._init_dnd()          # 必须先加载 tkdnd，历史气泡才能注册拖出
         self._load_conversations()
         self._tick()
 
@@ -240,6 +368,14 @@ class App(tk.Tk):
         if self._title_clicks < 8:
             return
         self._title_clicks = 0
+        # 「关于」窗口是 grab_set() 的模态框，若从那里触发，口令框会被挡住不显示。
+        # 先释放子窗口的 grab，保证隐藏入口在任何入口都能正常弹出。
+        for w in self.winfo_children():
+            if isinstance(w, tk.Toplevel):
+                try:
+                    w.grab_release()
+                except Exception:
+                    pass
         pwd = simpledialog.askstring("管理员验证", "请输入管理口令：",
                                      show="*", parent=self)
         if pwd is None:
@@ -413,8 +549,12 @@ class App(tk.Tk):
                  font=FONT_SM).pack(side="left")
 
         # 右侧操作区：状态灯 + 胶囊按钮
-        self.lbl_status = tk.Label(top, text="●  就绪", bg=BG_SIDE, fg=OK_GREEN, font=FONT_SM)
+        self.lbl_status = _StatusLabel(top, text="●  就绪", bg=BG_SIDE,
+                                       fg=OK_GREEN, font=FONT_SM)
         self.lbl_status.pack(side="right", padx=(4, 16))
+        # 顶栏变宽/变窄时重算上限，保证状态文字永远不会压到功能按钮
+        top.bind("<Configure>", lambda _e: self.lbl_status.refit())
+        self.after(120, self.lbl_status.refit)
 
         for text, cmd in (("关于", self._open_about),
                           ("设置", self._open_settings),
@@ -476,7 +616,8 @@ class App(tk.Tk):
         tk.Frame(side, bg=LINE, height=1).pack(fill="x", padx=12, pady=(0, 10))
 
         self.lbl_net = tk.Label(foot, bg=BG_SIDE, fg=FG_TIME, font=("Consolas", 8),
-                                text=f":{self.cfg.port}  {local_ip()}", anchor="w")
+                                text=f":{self.cfg.port}  {local_ip()}", anchor="w",
+                                wraplength=252, justify="left")
         self.lbl_net.pack(fill="x")
 
         theme_row = tk.Frame(foot, bg=BG_SIDE)
@@ -544,6 +685,13 @@ class App(tk.Tk):
         )
         self.canvas.bind_all("<MouseWheel>", self._on_wheel)
 
+        # 拖入时的悬浮提示：用 place 覆盖在消息区上方，不改变原有布局，
+        # 也不会挤动输入框；窗口拉伸时自动保持居中。
+        self.dnd_tip = tk.Label(
+            wrap, text="↧  松开鼠标：文件立即发给当前设备 · 文字进输入框",
+            bg=ACCENT, fg="white", font=("Microsoft YaHei UI", 10, "bold"),
+            padx=18, pady=9, bd=0, relief="flat")
+
         # ---------------- 输入区 ----------------
         bottom = tk.Frame(right, bg=BG)
         bottom.pack(fill="x", padx=20, pady=(8, 16))
@@ -559,9 +707,15 @@ class App(tk.Tk):
         self._chip(bar, "群发", self._open_group, kind="solid",
                    padx=12, pady=5).pack(side="left")
 
-        self.lbl_hint = tk.Label(bar, text="回车发送 · Shift+回车换行", bg=BG, fg=FG_TIME,
-                                 font=FONT_SM)
+        self.lbl_hint = tk.Label(
+            bar, text="回车发送 · Shift+回车换行 · 拖入文件即发，聊天文件可拖出",
+            bg=BG, fg=FG_TIME, font=FONT_SM)
         self.lbl_hint.pack(side="right")
+
+        # 待发送附件条：只在「未选设备时拖入」等兜底场景暂存，
+        # 正常拖入沿用原版 LocalSend 行为——松手即发，不经过这里。
+        # 无固定高度、按内容自适应，窗口拉伸时跟着 bottom 一起变宽。
+        self.attach_box = tk.Frame(bottom, bg=BG_INPUT)
 
         # 输入框：外层 Frame 当 1px 描边，内层当底色。
         # 不用 highlightthickness —— 它和 Text 自带的高亮框会叠出两层亮边
@@ -590,6 +744,269 @@ class App(tk.Tk):
         # 聚焦时整圈描边变强调色，给出明确的输入焦点反馈
         self.text.bind("<FocusIn>", lambda e: self.box.configure(bg=ACCENT))
         self.text.bind("<FocusOut>", lambda e: self.box.configure(bg=LINE))
+
+    # ---------------- 拖放（v2.6.0） ----------------
+    def _init_dnd(self) -> None:
+        """加载 tkdnd。组件缺失时只关闭拖放，其余功能照常可用。"""
+        try:
+            ver = dnd.enable(self)
+        except Exception as e:
+            self._dnd_ready = False
+            protocol.trace("WARN", f"拖放不可用：{e}")
+            try:
+                self.lbl_hint.configure(
+                    text="回车发送 · Shift+回车换行（拖放组件未加载）")
+            except Exception:
+                pass
+            return
+        self._dnd_ready = True
+        try:
+            self._drop_binder = dnd.DropBinder(
+                self, self._dnd_enter, self._dnd_leave, self._dnd_drop)
+        except Exception as e:
+            self._dnd_ready = False
+            protocol.trace("WARN", f"拖放绑定器初始化失败：{e}")
+            return
+        # 主窗口、左右两大区、消息画布、输入区都注册一遍：
+        # Windows 的 OLE 拖放按 HWND 命中，子控件覆盖父容器时需要各自注册。
+        for w in (self, self.side_canvas, self.side_inner, self.canvas,
+                  self.msg_frame, self.box, self._box_inner, self.text,
+                  self.btn_send, self.attach_box, self.dnd_tip, self.lbl_hint):
+            self._reg_drop_static(w)
+        self._register_all_drop_targets()
+        protocol.trace("INFO", f"tkdnd {ver} 拖放已启用")
+
+    def _register_all_drop_targets(self) -> None:
+        """递归给当前所有控件注册拖入。
+
+        Windows OLE 按鼠标下的 HWND 精确命中，不会自动向父窗口冒泡；
+        Tk 里每个控件都是独立 HWND，所以只注册几个大容器会漏。
+        这里全量覆盖，DropBinder 自带幂等，重复调用几乎零开销。
+        """
+        if not self._dnd_ready:
+            return
+
+        def walk(w):
+            yield w
+            try:
+                kids = w.winfo_children()
+            except Exception:
+                return
+            for c in kids:
+                yield from walk(c)
+
+        try:
+            for w in walk(self):
+                self._drop_binder.bind(w)
+        except Exception as e:
+            protocol.trace("WARN", f"批量注册拖入失败：{e}")
+
+    def _reg_drop_static(self, w) -> None:
+        if not self._dnd_ready:
+            return
+        key = str(w)
+        if key in self._dnd_static:
+            return
+        try:
+            self._drop_binder.bind(w)
+            self._dnd_static.add(key)
+        except Exception as e:
+            protocol.trace("WARN", f"注册拖入失败 {key}：{e}")
+
+    def _reg_drop_dynamic(self, w) -> None:
+        """气泡/胶囊每次重建都重新注册。
+
+        不缓存 widget path —— Tk 销毁后会复用同名路径，缓存会误判成已注册。
+        控件 destroy 时 tkinterdnd2 会自动注销对应 Tcl 命令，不泄漏。
+        """
+        if not self._dnd_ready:
+            return
+        try:
+            self._drop_binder.bind(w)
+        except Exception as e:
+            protocol.trace("WARN", f"注册拖入失败：{e}")
+
+    def _reg_drag(self, w, payload_fn) -> None:
+        if not self._dnd_ready:
+            return
+        try:
+            dnd.register_drag_source(w, payload_fn)
+        except Exception as e:
+            protocol.trace("WARN", f"注册拖出失败：{e}")
+
+    def _restore_box_border(self) -> None:
+        try:
+            focus = self.focus_get()
+            self.box.configure(bg=ACCENT if focus is self.text else LINE)
+        except Exception:
+            try:
+                self.box.configure(bg=LINE)
+            except Exception:
+                pass
+
+    def _dnd_enter(self, _e=None) -> None:
+        self._dnd_active = True
+        try:
+            self._dnd_prev_status = (self.lbl_status.cget("text"),
+                                     self.lbl_status.cget("fg"))
+        except Exception:
+            self._dnd_prev_status = ("●  就绪", OK_GREEN)
+        try:
+            self.box.configure(bg=OK_GREEN)
+            self.dnd_tip.place(relx=0.5, rely=0.04, anchor="n")
+            self.lbl_status.configure(text="松开即发送给当前设备", fg=WARN_ORANGE)
+        except Exception:
+            pass
+
+    def _dnd_leave(self, _e=None) -> None:
+        self._dnd_active = False
+        try:
+            self.dnd_tip.place_forget()
+        except Exception:
+            pass
+        self._restore_box_border()
+        try:
+            text, color = getattr(self, "_dnd_prev_status", ("●  就绪", OK_GREEN))
+            self.lbl_status.configure(text=text, fg=color)
+        except Exception:
+            pass
+
+    def _dnd_drop(self, e) -> None:
+        """恢复原版 LocalSend 的核心行为：拖进窗口的文件松手即发送。
+
+        文字仍进输入框（整段是已存在路径时按文件处理）；只有当前没有
+        选中设备时，文件才退回到「待发送」暂存，避免误丢文件。
+        """
+        self._dnd_leave()
+        kind, payload = dnd.classify_drop(
+            getattr(e, "data", ""), getattr(e, "type", ""))
+        problems: list[str] = []
+        got_text = False
+        if kind == "files":
+            files, problems = dnd.expand_paths(payload)
+        else:
+            text, files = dnd.split_drop_text(payload)
+            if text:
+                got_text = True
+                try:
+                    cur = self.text.get("1.0", "end-1c")
+                    if cur and not cur.endswith("\n"):
+                        self.text.insert("end", "\n")
+                    self.text.insert("end", text)
+                    self.text.see("end")
+                except Exception:
+                    pass
+
+        sent = self._send_dropped_files(files) if files else 0
+        added = self._add_attachments(files) if files and not sent else 0
+
+        bits = []
+        if sent:
+            bits.append(f"已直接发送 {sent} 个文件")
+        if added:
+            bits.append(f"{added} 个文件已暂存 · 选设备后点发送")
+        if got_text:
+            bits.append("文字已放入输入框")
+        if bits:
+            try:
+                self.lbl_status.configure(
+                    text=" · ".join(bits), fg=OK_GREEN if sent else WARN_ORANGE)
+            except Exception:
+                pass
+        if problems:
+            shown = "\n".join(problems[:5])
+            if len(problems) > 5:
+                shown += f"\n…另有 {len(problems) - 5} 条"
+            try:
+                messagebox.showwarning("部分文件未能发送", shown, parent=self)
+            except Exception:
+                pass
+        try:
+            self.text.focus_set()
+        except Exception:
+            pass
+
+    def _send_dropped_files(self, paths) -> int:
+        """拖入即发：复用已有的文件发送链路，返回实际发出的文件数。
+
+        没选设备时返回 0，由调用方把文件放进待发送区；不在后台线程里
+        弹窗或访问控件，`_send_paths_async` 自行起线程。`expand_paths`
+        在这里再做一次，防止调用方直接传入未展开/已失效的路径。
+        """
+        valid, _problems = dnd.expand_paths(paths)
+        if not valid:
+            return 0
+        target = self._current_peer()
+        if target is None:
+            return 0
+        # 同一批文件若此前因未选设备暂存过，发送时从待发送区移除，避免重复
+        if self._attachments:
+            for p in valid:
+                if p in self._attachments:
+                    self._attachments.remove(p)
+            self._render_attachments()
+        try:
+            self.lbl_status.configure(
+                text=f"拖入 {len(valid)} 个文件，正在发送…", fg=WARN_ORANGE)
+        except Exception:
+            pass
+        self._send_paths_async(valid, target)
+        return len(valid)
+
+    def _add_attachments(self, paths) -> int:
+        added = 0
+        for p in paths or []:
+            if p not in self._attachments:
+                self._attachments.append(p)
+                added += 1
+        if added:
+            self._render_attachments()
+        return added
+
+    def _render_attachments(self) -> None:
+        for w in self.attach_box.winfo_children():
+            w.destroy()
+        if not self._attachments:
+            self.attach_box.pack_forget()
+            return
+        # before=self.box：始终贴在输入框正上方，不受后续 pack 顺序影响
+        self.attach_box.pack(fill="x", pady=(0, 8), before=self.box)
+
+        head = tk.Frame(self.attach_box, bg=BG_INPUT)
+        head.pack(fill="x", padx=10, pady=(8, 2))
+        tk.Label(head, text=f"待发送 ({len(self._attachments)})",
+                 bg=BG_INPUT, fg=FG_DIM, font=FONT_SM).pack(side="left")
+        clear = self._chip(head, "清空", self._clear_attachments,
+                           kind="ghost", padx=9, pady=2)
+        clear.pack(side="right")
+
+        row = tk.Frame(self.attach_box, bg=BG_INPUT)
+        row.pack(fill="x", padx=8, pady=(2, 8))
+        for p in self._attachments[:8]:
+            name = os.path.basename(p) or p
+            if len(name) > 24:
+                name = name[:23] + "…"
+            chip = tk.Label(row, text=f"📎 {name}  ×", bg=BG_HOVER, fg=FG,
+                            font=FONT_SM, padx=9, pady=3, cursor="hand2")
+            chip.pack(side="left", padx=(0, 5), pady=2)
+            chip.bind("<Button-1>", lambda e, q=p: self._remove_attachment(q))
+            self._reg_drop_dynamic(chip)
+        rest = len(self._attachments) - 8
+        if rest > 0:
+            tk.Label(row, text=f"…另有 {rest} 个", bg=BG_INPUT,
+                     fg=FG_TIME, font=FONT_SM).pack(side="left", padx=4)
+        for w in (head, row, clear):
+            self._reg_drop_dynamic(w)
+        self.after_idle(self._register_all_drop_targets)
+
+    def _remove_attachment(self, path: str) -> None:
+        if path in self._attachments:
+            self._attachments.remove(path)
+            self._render_attachments()
+
+    def _clear_attachments(self) -> None:
+        self._attachments.clear()
+        self._render_attachments()
 
     # ---------------- 会话列表 ----------------
     def _load_conversations(self) -> None:
@@ -635,8 +1052,16 @@ class App(tk.Tk):
         # 计数必须基于过滤后的 _rows，永远等于列表里数得出来的数量
         online_n = count_online([r for _k, r in self._rows])
         try:
-            self.lbl_count.configure(
-                text=f"{online_n} 在线" if online_n else f"{len(self._rows)} 个对话")
+            # 在线高亮 ⑤：顶部计数也做成实心绿徽章；文案保持「N 在线」不变，
+            # 计数口径仍等于列表里数得出来的可见在线行。
+            if online_n:
+                self.lbl_count.configure(
+                    text=f"{online_n} 在线", bg=OK_GREEN, fg="#ffffff",
+                    font=("Microsoft YaHei UI", 9, "bold"))
+            else:
+                self.lbl_count.configure(
+                    text=f"{len(self._rows)} 个对话", bg=BG_HOVER, fg=FG_DIM,
+                    font=("Microsoft YaHei UI", 8))
         except Exception:
             pass
         try:
@@ -658,30 +1083,36 @@ class App(tk.Tk):
 
         for _kind, row in self._rows:
             self._make_row(row)
+        self.after_idle(self._register_all_drop_targets)
 
     def _make_row(self, row: dict) -> None:
         fp = row["fp"]
         selected = fp == self.current_fp
+        online = bool(row["online"])
         bg = BG_SEL if selected else BG_SIDE
 
         box = tk.Frame(self.side_inner, bg=bg, cursor="hand2")
         box.pack(fill="x", padx=6, pady=2)
 
-        inner = tk.Frame(box, bg=bg)
-        inner.pack(fill="x", padx=8, pady=7)
+        # 在线高亮 ①：整行左侧一根 5px 亮色竖条，扫一眼就能分辨谁在线
+        bar = tk.Frame(box, bg=OK_GREEN if online else bg, width=5)
+        bar.pack(side="left", fill="y")
+        bar.pack_propagate(False)
 
-        # 头像：首字 + 在线圆点叠加在右下
-        av = tk.Frame(inner, bg=bg, width=36, height=36)
+        inner = tk.Frame(box, bg=bg)
+        inner.pack(fill="x", padx=(9, 8), pady=7)
+
+        # 在线高亮 ②：头像外圈一圈亮绿描边（离线不描边）
+        ch = (row["alias"] or "?").strip()[:1].upper() or "?"
+        av = tk.Frame(inner, bg=OK_GREEN if online else bg, width=38, height=38)
         av.pack(side="left")
         av.pack_propagate(False)
-
-        ch = (row["alias"] or "?").strip()[:1].upper() or "?"
-        av_box = tk.Frame(av, bg=ACCENT if row["online"] else BG_HOVER,
+        av_box = tk.Frame(av, bg=ACCENT if online else BG_HOVER,
                           width=36, height=36)
-        av_box.pack()
+        av_box.pack(padx=1, pady=1)
         av_box.pack_propagate(False)
-        av_lbl = tk.Label(av_box, text=ch, bg=ACCENT if row["online"] else BG_HOVER,
-                          fg="white" if row["online"] else FG_TIME,
+        av_lbl = tk.Label(av_box, text=ch, bg=ACCENT if online else BG_HOVER,
+                          fg="white" if online else FG_TIME,
                           font=("Microsoft YaHei UI", 12, "bold"))
         av_lbl.pack(expand=True)
 
@@ -691,22 +1122,32 @@ class App(tk.Tk):
         line1 = tk.Frame(text_col, bg=bg)
         line1.pack(fill="x")
 
+        # 在线高亮 ③：设备名用主题绿加粗，与离线灰字拉开差距
         name = tk.Label(line1, text=row["alias"], bg=bg,
-                        fg=FG if row["online"] else FG_DIM,
-                        font=FONT_NAME, anchor="w")
+                        fg=OK_GREEN if online else FG_DIM,
+                        font=(("Microsoft YaHei UI", 11, "bold") if online
+                              else FONT_NAME), anchor="w")
         name.pack(side="left")
 
-        if row["online"]:
-            tk.Label(line1, text="●", bg=bg, fg=OK_GREEN,
-                     font=("Consolas", 7)).pack(side="right", padx=(4, 0))
+        badge = None
+        if online:
+            # 在线高亮 ④：带文字的实心胶囊徽章，取代原来那个 7px 小绿点
+            badge = tk.Label(line1, text="● 在线", bg=OK_GREEN, fg="#ffffff",
+                             font=("Microsoft YaHei UI", 9, "bold"),
+                             padx=8, pady=2, bd=0)
+            badge.pack(side="right", padx=(4, 0))
 
-        prev_text = row["preview"] or ("在线，可开始对话" if row["online"] else "暂无消息")
+        prev_text = row["preview"] or ("在线，可开始对话" if online else "暂无消息")
         clip = prev_text[:16] + ("…" if len(prev_text) > 16 else "")
         prev = tk.Label(text_col, text=clip, bg=bg, fg=FG_TIME, font=FONT_SM,
                         anchor="w", justify="left")
         prev.pack(fill="x", pady=(2, 0))
 
-        for w in (box, inner, av, av_box, av_lbl, text_col, line1, name, prev):
+        widgets = [box, bar, inner, av, av_box, av_lbl,
+                   text_col, line1, name, prev]
+        if badge is not None:
+            widgets.append(badge)
+        for w in widgets:
             w.bind("<Button-1>", lambda e, r=row: self._open_row(r))
             w.bind("<Button-3>", lambda e, r=row: self._row_menu(e, r))
             w.bind("<Enter>", lambda e, b=box, f=fp: self._row_hover(b, f, True))
@@ -873,6 +1314,7 @@ class App(tk.Tk):
                 self._add_day(day)
             self._add_bubble(m)
         self.after(30, lambda: self.canvas.yview_moveto(1.0))
+        self.after_idle(self._register_all_drop_targets)
 
     def _add_day(self, day: str) -> None:
         wrap = tk.Frame(self.msg_frame, bg=BG)
@@ -1007,6 +1449,33 @@ class App(tk.Tk):
             meta.configure(cursor="hand2")
             meta.bind("<Button-1>", lambda e, t=m["body"], mids=m["id"]: self._retry_text(t, mids))
 
+        # ---- 双向拖放 ----
+        # 文件气泡按住左键拖到资源管理器/桌面即复制文件；文字气泡可拖出纯文本。
+        fpath = m.get("file_path") or ""
+        body = str(m["body"] or "")
+        is_file = m["kind"] == "file"
+        kind = "file" if (is_file and fpath) else "text"
+
+        def payload(k=kind, p=fpath, b=body):
+            result = dnd.drag_payload(kind=k, path=p, body=b)
+            if result is None and k == "file":
+                try:
+                    self.lbl_status.configure(
+                        text="源文件已移动，无法拖出副本", fg=WARN_ORANGE)
+                except Exception:
+                    pass
+            return result
+
+        drag_widgets = ([cv] if card is None else list(card.winfo_children()))
+        drop_widgets = [row, holder, meta]
+        if card is not None:
+            drop_widgets.append(card)
+        drop_widgets.extend(drag_widgets)
+        for w in dict.fromkeys(drop_widgets):
+            self._reg_drop_dynamic(w)
+        for w in drag_widgets:
+            self._reg_drag(w, payload)
+
         self._bubbles.append(row)
 
     def _on_wheel(self, evt) -> None:
@@ -1024,60 +1493,125 @@ class App(tk.Tk):
         return "break"
 
     def _send_text(self) -> None:
+        """发送输入框文字 + 待发送附件。
+
+        文字和文件放在同一个后台线程里**串行**发送：LocalSend 对端一次
+        只能处理一个会话，并发两个 prepare-upload 会撞 409。
+        """
         text = self.text.get("1.0", "end").strip()
-        if not text:
+        paths = list(self._attachments)
+        if not text and not paths:
             return
         target = self._current_peer()
         if target is None:
             messagebox.showinfo("未选择设备", "请先在左侧选择一台在线设备。", parent=self)
             return
 
+        # 发送前再校验一次：拖进来之后文件可能已被移动/删除
+        valid_paths, problems = dnd.expand_paths(paths)
+        if problems:
+            shown = "\n".join(problems[:4])
+            if len(problems) > 4:
+                shown += f"\n…另有 {len(problems) - 4} 条"
+            try:
+                messagebox.showwarning("部分文件已不可用", shown, parent=self)
+            except Exception:
+                pass
+        if not text and not valid_paths:
+            self._clear_attachments()
+            return
+
         self.text.delete("1.0", "end")
-        self.lbl_status.configure(text="发送中…", fg=WARN_ORANGE)
+        self._clear_attachments()
+        self.lbl_status.configure(
+            text="发送中…" + (f"（含 {len(valid_paths)} 个文件）" if valid_paths else ""),
+            fg=WARN_ORANGE)
         self.update_idletasks()
 
         fp = self.current_fp
-        # 先本地落库并回显：发送过程/失败都要在聊天里留下痕迹，
-        # 否则用户会以为「消息根本没发出去」，也无从点重试。
-        msg = self.store.add_message(
-            "out", fp, target.get("alias") or "", text, kind="text", status="sending",
-        )
-        self._render_history()
-        self._render_sidebar()
+        msg = None
+        if text:
+            # 先本地落库并回显：发送过程/失败都要在聊天里留下痕迹，
+            # 否则用户会以为「消息根本没发出去」，也无从点重试。
+            msg = self.store.add_message(
+                "out", fp, target.get("alias") or "", text, kind="text", status="sending",
+            )
+            self._render_history()
+            self._render_sidebar()
 
         def worker():
-            # 任何异常都必须落到 failed，否则气泡会永久停在「发送中」
-            try:
-                res = protocol.send_text(target, self._my_info(), text, self.cfg.alias)
-                ok = bool(res.ok)
-                detail = res.message or ""
-                if not ok:
-                    # 给出可执行的下一步，而不是只丢一个「发送失败」
-                    detail = detail or "发送失败"
-                    if res.is_pin_required:
-                        detail += "（可在设置里填写 PIN）"
-                    elif res.is_busy:
-                        detail += "（对方正在接收其他设备的传输，稍后重试）"
-                    elif res.is_declined:
-                        detail += "（对方拒绝了本次接收）"
-            except Exception as e:
-                ok, detail = False, f"发送异常：{e}"
+            if msg is not None:
+                # 任何异常都必须落到 failed，否则气泡会永久停在「发送中」
+                try:
+                    res = protocol.send_text(target, self._my_info(), text, self.cfg.alias)
+                    ok = bool(res.ok)
+                    detail = res.message or ""
+                    if not ok:
+                        detail = detail or "发送失败"
+                        if res.is_pin_required:
+                            detail += "（可在设置里填写 PIN）"
+                        elif res.is_busy:
+                            detail += "（对方正在接收其他设备的传输，稍后重试）"
+                        elif res.is_declined:
+                            detail += "（对方拒绝了本次接收）"
+                except Exception as e:
+                    ok, detail = False, f"发送异常：{e}"
 
-            try:
-                self.store.set_status(msg["id"], "sent" if ok else "failed")
-            except Exception as e:
-                protocol.trace("ERR", f"set_status 失败：{e}")
-            try:
-                self.bus.emit("msg_status", mid=msg["id"],
-                              status="sent" if ok else "failed",
-                              fingerprint=fp, detail=detail)
-                if not ok:
-                    self.bus.emit("error", text=detail)
-            except Exception:
-                pass
+                try:
+                    self.store.set_status(msg["id"], "sent" if ok else "failed")
+                except Exception as e:
+                    protocol.trace("ERR", f"set_status 失败：{e}")
+                try:
+                    self.bus.emit("msg_status", mid=msg["id"],
+                                  status="sent" if ok else "failed",
+                                  fingerprint=fp, detail=detail)
+                    if not ok:
+                        self.bus.emit("error", text=detail)
+                except Exception:
+                    pass
+
+            if valid_paths:
+                self._send_paths_sync(valid_paths, target)
 
         import threading
         threading.Thread(target=worker, daemon=True).start()
+
+    def _send_paths_sync(self, paths, target) -> None:
+        """真正发文件（已在后台线程里调用，不要再起线程）。"""
+        def progress(name: str, res) -> None:
+            self.bus.emit("progress", text=f"{name} {'完成' if res.ok else '失败'}")
+
+        try:
+            results = protocol.send_files(
+                target, self._my_info(), list(paths), progress=progress)
+        except Exception as e:
+            self.bus.emit("error", text=f"发送文件失败：{e}")
+            return
+        for name, res in results:
+            if res.ok:
+                path = ""
+                for cand in paths:
+                    if os.path.basename(cand) == name:
+                        path = cand
+                        break
+                size = 0
+                try:
+                    size = os.path.getsize(path) if path else 0
+                except Exception:
+                    pass
+                msg = self.store.add_message(
+                    "out", self.current_fp, target.get("alias") or "",
+                    name, kind="file", file_path=path, file_size=size,
+                )
+                self.bus.emit("message", message=msg, alias="我",
+                              fingerprint=self.current_fp)
+            else:
+                self.bus.emit("error", text=f"{name}：{res.message}")
+
+    def _send_paths_async(self, paths, target) -> None:
+        import threading
+        threading.Thread(target=lambda: self._send_paths_sync(paths, target),
+                         daemon=True).start()
 
     def _pick_files(self) -> None:
         target = self._current_peer()
@@ -1089,38 +1623,7 @@ class App(tk.Tk):
             return
 
         self.lbl_status.configure(text=f"发送 {len(paths)} 个文件…", fg=WARN_ORANGE)
-
-        def progress(name: str, res) -> None:
-            self.bus.emit("progress", text=f"{name} {'完成' if res.ok else '失败'}")
-
-        def worker():
-            results = protocol.send_files(
-                target, self._my_info(), list(paths), progress=progress
-            )
-            for name, res in results:
-                if res.ok:
-                    p = Path(name)
-                    path = ""
-                    for cand in paths:
-                        if os.path.basename(cand) == name:
-                            path = cand
-                            break
-                    size = 0
-                    try:
-                        size = os.path.getsize(path) if path else 0
-                    except Exception:
-                        pass
-                    msg = self.store.add_message(
-                        "out", self.current_fp, target.get("alias") or "",
-                        name, kind="file", file_path=path, file_size=size,
-                    )
-                    self.bus.emit("message", message=msg, alias="我",
-                                  fingerprint=self.current_fp)
-                else:
-                    self.bus.emit("error", text=f"{name}：{res.message}")
-
-        import threading
-        threading.Thread(target=worker, daemon=True).start()
+        self._send_paths_async(list(paths), target)
 
     def _current_peer(self) -> dict | None:
         if not self.current_fp:
@@ -1279,9 +1782,12 @@ class App(tk.Tk):
         online = count_online([r for _k, r in self._rows])
         if online:
             self.lbl_status.configure(
-                text=f"扫描完成：在线 {online} 台（本次新发现 {found} 台）", fg=OK_GREEN)
+                text=f"扫描完成：在线 {online} 台", fg=OK_GREEN)
+            self.lbl_net.configure(
+                text=f":{self.cfg.port}  {local_ip()}  ·  新发现 {found} 台",
+                fg=FG_TIME)
         else:
-            # 零设备时要说清「发了没人回」还是「根本没发出去」，否则用户无从下手
+            # 顶栏只放短结论，长诊断信息放左侧底部，避免盖住功能按钮
             sent = int(st.get("sent") or 0)
             recv = int(st.get("recv") or 0)
             joined = int(st.get("joined") or 0)
@@ -1291,8 +1797,10 @@ class App(tk.Tk):
                 hint = "组播加入失败，请点「诊断」查看"
             elif sent and recv == 0:
                 hint = "宣告已发出但无回应，多为防火墙/AP 隔离，请点「诊断」"
-            self.lbl_status.configure(
-                text=f"未发现设备（端口 {port}，发包 {sent}，收包 {recv}）· {hint}",
+            self.lbl_status.configure(text="未发现设备 · 看左下",
+                                      fg=WARN_ORANGE)
+            self.lbl_net.configure(
+                text=f":{port or self.cfg.port}  发包 {sent} / 收包 {recv}\n{hint}",
                 fg=WARN_ORANGE)
 
     def _reload_keep_selection(self) -> None:
@@ -1310,7 +1818,7 @@ class App(tk.Tk):
         if getattr(self, "_scanning_ui", False):
             return
         self._scanning_ui = True
-        self.lbl_status.configure(text="正在扫描局域网（组播 + 子网）…", fg=WARN_ORANGE)
+        self.lbl_status.configure(text="正在扫描局域网…", fg=WARN_ORANGE)
 
         def worker():
             found = 0
@@ -1784,7 +2292,7 @@ class ThemeDialog(tk.Toplevel):
         self.app = app
         self.title("选择配色")
         self.configure(bg=BG)
-        self.resizable(False, False)
+        self.resizable(True, True)
         self.transient(app)
         self.grab_set()
         self._build()
@@ -1799,16 +2307,18 @@ class ThemeDialog(tk.Toplevel):
         tk.Label(wrap, text="点一下立即生效，界面会原地换肤，聊天记录不受影响。",
                  bg=BG, fg=FG_DIM, font=FONT_SM, anchor="w").pack(fill="x", pady=(3, 14))
 
+        per_row = 4   # 每行最多 4 张卡片，主题变多时自动换行，避免撑爆窗口
         for title, keys in (("深色", [k for k in _theme.ORDER if not _theme.is_light(k)]),
                             ("浅色", [k for k in _theme.ORDER if _theme.is_light(k)])):
             if not keys:
                 continue
             tk.Label(wrap, text=title, bg=BG, fg=FG_TIME, font=FONT_SM,
                      anchor="w").pack(fill="x", pady=(4, 6))
-            row = tk.Frame(wrap, bg=BG)
-            row.pack(fill="x", pady=(0, 10))
-            for k in keys:
-                self._card(row, k).pack(side="left", padx=(0, 10))
+            for start in range(0, len(keys), per_row):
+                row = tk.Frame(wrap, bg=BG)
+                row.pack(fill="x", pady=(0, 10))
+                for k in keys[start:start + per_row]:
+                    self._card(row, k).pack(side="left", padx=(0, 10))
 
         tk.Frame(self, bg=BG).pack(fill="x", pady=(0, 4))
         foot = tk.Frame(self, bg=BG)
@@ -1897,7 +2407,7 @@ class GroupDialog(tk.Toplevel):
         self.title("群发消息")
         self.configure(bg=BG)
         self.transient(app)
-        self.resizable(False, False)
+        self.resizable(True, True)
 
         self._files: list[str] = []
         self._checks: dict[str, tk.BooleanVar] = {}
@@ -2249,7 +2759,7 @@ class AddPeerDialog(tk.Toplevel):
         self.title("手动添加设备")
         self.configure(bg=BG)
         self.geometry("480x220")
-        self.resizable(False, False)
+        self.resizable(True, True)
         self.transient(app)
         self.grab_set()
         self._build()
@@ -2563,29 +3073,43 @@ class AboutDialog(tk.Toplevel):
         from . import __version__
         self.title("关于 LocalSend Chat")
         self.configure(bg=BG)
-        self.geometry("470x370")
-        self.resizable(False, False)
+        self.geometry("510x560")
+        self.minsize(470, 420)
+        self.resizable(True, True)
         self.transient(app)
         self.grab_set()
 
         tk.Label(self, text=app.cfg.panel_title, bg=BG, fg=FG,
                  font=("Microsoft YaHei UI", 14, "bold")).pack(pady=(22, 2))
-        tk.Label(self, text=f"版本 v{__version__}", bg=BG, fg=ACCENT,
-                 font=("Consolas", 10)).pack()
+        lbl_ver = tk.Label(self, text=f"版本 v{__version__}", bg=BG, fg=ACCENT,
+                           font=("Consolas", 10), cursor="hand2")
+        lbl_ver.pack()
+        # 这里原来只有一句「双击版本号八次」的说明，却没绑事件 —— 用户在这
+        # 个窗口连点八次当然没反应。说明已按要求撤掉，隐藏入口保留并修好。
+        lbl_ver.bind("<Double-Button-1>",
+                     lambda e, a=app: a._on_title_double_click(e))
         text = (
             "一个套在 LocalSend Protocol v2 之上的局域网聊天窗口。\n"
             "协议层未作改动，可与官方 LocalSend 客户端互相收发。\n\n"
             "· 纯局域网，无服务器、无账号、不上传云端\n"
-            "· 聊天气泡、6 套配色、图片缩略图、一对多群发\n"
-            "· 链接分享：手机浏览器直接下载文件\n\n"
+            "· 聊天气泡、8 套配色、图片缩略图、一对多群发\n"
+            "· 链接分享：手机浏览器直接下载文件\n"
+            "· 双向拖放：拖入文件立即发送，聊天文件可拖出复制\n\n"
+            "【拖入】像原版 LocalSend 一样，把文件从资源管理器\n"
+            "或桌面拖进窗口，松手即发给当前选中的设备。\n"
+            "文字拖进输入框；未选设备时文件暂存入「待发送」，\n"
+            "选中设备后点【发送】即可补发。\n\n"
+            "【拖出】按住文件气泡左键拖到桌面或文件夹，\n"
+            "松手即复制一份副本（原文件不动）；文字气泡可拖进\n"
+            "记事本、Word 等接受文本的地方。\n\n"
             "53317 用于协议收发，53319 用于链接分享。\n"
             "聊天记录与配置位于 %APPDATA%\\LocalSendChat\\。\n\n"
             "本项目非 LocalSend 官方衍生版本，与上游无隶属关系。\n"
-            "LocalSend 为 Apache-2.0 协议的开源项目。\n\n"
-            "提示：双击版本号八次可修改面板名称。"
+            "LocalSend 为 Apache-2.0 协议的开源项目。"
         )
         tk.Label(self, text=text, bg=BG, fg=FG_DIM, font=FONT_SM,
-                 justify="left", anchor="w").pack(fill="x", padx=24, pady=(16, 0))
+                 justify="left", anchor="w", wraplength=460).pack(
+                     fill="x", padx=24, pady=(16, 0))
         tk.Button(self, text="关闭", command=self.destroy, bg=ACCENT, fg="white",
                   font=FONT_UI, relief="flat", bd=0, padx=26, pady=5,
                   cursor="hand2").pack(side="bottom", pady=14)

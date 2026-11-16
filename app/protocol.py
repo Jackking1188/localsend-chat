@@ -201,7 +201,9 @@ def _file_meta(fid: str, name: str, ftype: str, payload: bytes) -> dict:
         "fileType": ftype,
         "sha256": _sha256_hex(payload),
     }
-    if ftype == "text":
+    # .txt 经 mimetypes 猜出来是 text/plain，不是 send_text 用的 "text"。
+    # 这里统一按文本处理，否则官方客户端会把 base64 预览当正文显示。
+    if ftype == "text" or ftype.startswith("text/"):
         # 文字消息：preview 即正文，接收端直接显示，无需再传文件
         meta["preview"] = _text_preview(payload)
     else:
@@ -325,6 +327,14 @@ def send_text(peer: dict, my_info: dict, text: str, alias: str,
     return last
 
 
+# 这些后缀在部分 Windows 上 mimetypes 会猜成 application/octet-stream，
+# 但内容确实是纯文本，必须走明文 preview，否则对方看到的是 base64 串。
+_TEXT_SUFFIXES = {
+    ".txt", ".text", ".md", ".markdown", ".csv", ".log", ".ini", ".cfg",
+    ".json", ".xml", ".yaml", ".yml", ".toml", ".py", ".js", ".css", ".html",
+}
+
+
 def send_files(peer: dict, my_info: dict, paths: list[str], pin: str = "",
                progress=None) -> list[tuple[str, SendResult]]:
     metas: dict[str, dict] = {}
@@ -342,6 +352,9 @@ def send_files(peer: dict, my_info: dict, paths: list[str], pin: str = "",
             continue
         fid = uuid.uuid4().hex
         ftype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        if ftype.startswith("text/") or path.suffix.lower() in _TEXT_SUFFIXES:
+            # 与 send_text 用同一个 type，确保官方客户端显示正文而不是 base64
+            ftype = "text"
         metas[fid] = _file_meta(fid, path.name, ftype, data)
         payloads[fid] = data
         names[fid] = path.name
@@ -351,7 +364,12 @@ def send_files(peer: dict, my_info: dict, paths: list[str], pin: str = "",
 
     ok, sid, tokens, err, code = prepare(peer, my_info, metas, pin=pin)
     if code == 204:
-        # 文件场景下 204 表示对方没有接受传输（没有产生会话）
+        # 纯文本文件：对方从 preview 直接拿到正文，204 = 已送达（同 send_text）
+        if all(m["fileType"] == "text" for m in metas.values()):
+            return [(names[fid],
+                     SendResult(True, "已送达", status=204, no_transfer=True))
+                    for fid in metas]
+        # 二进制文件场景下 204 表示对方没有接受传输（没有产生会话）
         msg = "对方未接收文件（204），请让对方在弹窗里点「接受」"
         return [(names[fid], SendResult(False, msg, status=204)) for fid in metas]
     if not ok:
